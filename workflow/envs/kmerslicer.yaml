@@ -6,3 +6,4 @@ dependencies:
   - biopython
   - pandas
   - pyarrow
+  - requests

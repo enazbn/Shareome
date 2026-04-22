@@ -2,7 +2,11 @@ fastas:
   - "CCHFV_seq_nr_clean.fasta"
   - "Rota_seq_nr_clean.fasta"
   - "RSV_seq_nr_clean.fasta"
-  - "human_refseq_nr_preclean1.fasta"
+  - "human_refseq_nr_cleaned.fasta"
 input_dir: "data"
 output_dir: "results"
 k: 9
+mismatch_thresholds:
+  - 0
+  - 1
+  - 2
