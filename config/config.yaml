@@ -3,10 +3,20 @@ fastas:
   - "Rota_seq_nr_clean.fasta"
   - "RSV_seq_nr_clean.fasta"
   - "human_refseq_nr_cleaned.fasta"
+
 input_dir: "data"
 output_dir: "results"
+
 k: 9
+
+matching_mode: "blosum"   # options: mismatch, blosum
+
 mismatch_thresholds:
   - 0
   - 1
   - 2
+
+blosum:
+  matrix: "BLOSUM62"
+  min_similarity_percent: 70
+  max_candidate_mismatches: 3
