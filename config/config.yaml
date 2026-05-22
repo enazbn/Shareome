@@ -18,5 +18,5 @@ mismatch_thresholds:
 
 blosum:
   matrix: "BLOSUM62"
-  min_similarity_percent: 70
-  max_candidate_mismatches: 3
+  min_similarity_percent: 80
+  max_candidate_mismatches: 1

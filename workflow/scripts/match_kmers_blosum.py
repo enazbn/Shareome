@@ -3,10 +3,16 @@
 """
 match_kmers_blosum.py
 
-BLOSUM-based similarity matching between viral and human k-mers.
+Optimized BLOSUM-based similarity matching between viral and human k-mers.
 
-This is intended as a secondary Shareome matching mode, separate from exact/mismatch
-matching. It uses the same upstream k-mer CSV files produced by kmerslicer.
+This version is designed for large Shareome runs.
+
+Main optimization:
+    - Human k-mer locations are collapsed by unique k-mer.
+    - The masked candidate index stores unique human k-mers only.
+    - Virus k-mer locations are also collapsed by unique k-mer.
+    - BLOSUM scores are calculated once per unique virus_kmer/human_kmer pair.
+    - Location expansion happens only after a pair passes the BLOSUM threshold.
 
 Input CSV columns:
     kmer
@@ -29,21 +35,11 @@ Output CSV columns:
     human_position
     virus_accession
     virus_position
-
-Example:
-    python workflow/scripts/match_kmers_blosum.py \
-        results/human_refseq_nr_cleaned_kmers.csv \
-        results/Rota_seq_nr_clean_kmers.csv \
-        results/Rota_seq_nr_clean_blosum_matched.csv \
-        --matrix BLOSUM62 \
-        --min-similarity-percent 70 \
-        --max-candidate-mismatches 3
 """
 
 import argparse
 import csv
 import os
-import sys
 from collections import defaultdict
 from itertools import combinations
 
@@ -51,17 +47,39 @@ from itertools import combinations
 VALID_AA = set("ACDEFGHIKLMNPQRSTVWY")
 
 
-def generate_masked_patterns(kmer, num_masks):
-    """
-    Generate masked versions of a k-mer by replacing num_masks positions with '*'.
+# ------------------------------------------------------------
+# Basic helpers
+# ------------------------------------------------------------
 
-    Example:
-        kmer = ABCD, num_masks = 2
-        patterns include: **CD, *B*D, *BC*, A**D, A*C*, AB**
+def is_valid_kmer(kmer):
+    return bool(kmer) and set(kmer).issubset(VALID_AA)
+
+
+def count_mismatches(seq1, seq2):
+    return sum(a != b for a, b in zip(seq1, seq2))
+
+
+def precompute_mask_positions(k, num_masks):
     """
+    Precompute mask-combination positions once per k.
+    """
+    if num_masks == 0:
+        return [()]
+
+    return list(combinations(range(k), num_masks))
+
+
+def generate_masked_patterns_from_positions(kmer, mask_positions):
+    """
+    Generate masked patterns using precomputed mask positions.
+    """
+    if mask_positions == [()]:
+        yield kmer
+        return
+
     kmer_list = list(kmer)
 
-    for positions in combinations(range(len(kmer)), num_masks):
+    for positions in mask_positions:
         masked = kmer_list.copy()
 
         for pos in positions:
@@ -70,30 +88,11 @@ def generate_masked_patterns(kmer, num_masks):
         yield "".join(masked)
 
 
-def count_mismatches(seq1, seq2):
-    """
-    Count position-wise mismatches between two equal-length sequences.
-    """
-    return sum(a != b for a, b in zip(seq1, seq2))
-
-
-def is_valid_kmer(kmer):
-    """
-    Keep only canonical amino-acid k-mers.
-    """
-    return bool(kmer) and set(kmer).issubset(VALID_AA)
-
+# ------------------------------------------------------------
+# BLOSUM helpers
+# ------------------------------------------------------------
 
 def load_blosum_matrix(matrix_name):
-    """
-    Load a substitution matrix from Biopython.
-
-    Requires:
-        biopython
-
-    Example:
-        conda install -c conda-forge biopython
-    """
     try:
         from Bio.Align import substitution_matrices
     except ImportError as exc:
@@ -113,45 +112,46 @@ def load_blosum_matrix(matrix_name):
         ) from exc
 
 
-def substitution_score(matrix, aa1, aa2):
+def matrix_to_fast_lookup(matrix):
     """
-    Get substitution score for an amino-acid pair.
-
-    Biopython matrices usually support tuple access, but this helper also tries
-    the reverse pair for safety.
+    Convert Biopython substitution matrix to plain dictionaries for faster scoring.
     """
-    try:
-        return matrix[aa1, aa2]
-    except Exception:
-        return matrix[aa2, aa1]
+    pair_score = {}
+    self_score = {}
+
+    aas = sorted(VALID_AA)
+
+    for aa1 in aas:
+        for aa2 in aas:
+            try:
+                score = matrix[aa1, aa2]
+            except Exception:
+                score = matrix[aa2, aa1]
+
+            pair_score[(aa1, aa2)] = float(score)
+
+    for aa in aas:
+        self_score[aa] = pair_score[(aa, aa)]
+
+    return pair_score, self_score
 
 
-def calculate_blosum_scores(virus_kmer, human_kmer, matrix):
-    """
-    Calculate raw and normalized BLOSUM similarity.
-
-    Normalization used here:
-        blosum_similarity_fraction = raw_score / virus_self_score
-
-    This asks:
-        How similar is the human k-mer to the viral k-mer relative to the
-        viral k-mer's own maximum self-score?
-    """
+def calculate_blosum_scores(virus_kmer, human_kmer, pair_score, self_score):
     raw_score = 0.0
     virus_self_score = 0.0
     human_self_score = 0.0
 
     for v_aa, h_aa in zip(virus_kmer, human_kmer):
-        raw_score += substitution_score(matrix, v_aa, h_aa)
-        virus_self_score += substitution_score(matrix, v_aa, v_aa)
-        human_self_score += substitution_score(matrix, h_aa, h_aa)
+        raw_score += pair_score[(v_aa, h_aa)]
+        virus_self_score += self_score[v_aa]
+        human_self_score += self_score[h_aa]
 
     if virus_self_score == 0:
         similarity_fraction = 0.0
     else:
         similarity_fraction = raw_score / virus_self_score
 
-    similarity_percent = similarity_fraction * 100
+    similarity_percent = similarity_fraction * 100.0
 
     return (
         raw_score,
@@ -162,20 +162,31 @@ def calculate_blosum_scores(virus_kmer, human_kmer, matrix):
     )
 
 
-def load_human_kmers_index(human_csv, max_candidate_mismatches):
-    """
-    Build a masked-pattern index for human k-mers.
+# ------------------------------------------------------------
+# Loading and indexing
+# ------------------------------------------------------------
 
-    This is only a candidate retrieval step. The final filtering is done using
-    the BLOSUM similarity score.
+def load_human_unique_index(human_csv, max_candidate_mismatches):
+    """
+    Load human k-mers and build a masked-pattern index using unique human k-mers.
 
     Returns:
-        index[k][pattern] -> list of (human_kmer, accession, position)
+        human_locs:
+            human_locs[human_kmer] = [(accession, position), ...]
+
+        human_index:
+            human_index[k][pattern] = [human_kmer1, human_kmer2, ...]
+
+        mask_cache:
+            mask_cache[k] = precomputed mask position combinations
     """
-    index = defaultdict(lambda: defaultdict(list))
+    human_locs = defaultdict(list)
+    human_index = defaultdict(lambda: defaultdict(list))
+    mask_cache = {}
 
     total_rows = 0
-    kept_rows = 0
+    valid_rows = 0
+    unique_kmers = 0
 
     with open(human_csv, newline="") as f:
         reader = csv.DictReader(f)
@@ -192,72 +203,67 @@ def load_human_kmers_index(human_csv, max_candidate_mismatches):
             total_rows += 1
 
             kmer = row["kmer"].strip().upper()
-            accession = row["accession"].strip()
-            position = row["position"].strip()
 
             if not is_valid_kmer(kmer):
                 continue
 
-            k = len(kmer)
+            accession = row["accession"].strip()
+            position = row["position"].strip()
 
-            if max_candidate_mismatches == 0:
-                index[k][kmer].append((kmer, accession, position))
-            else:
-                for pattern in generate_masked_patterns(kmer, max_candidate_mismatches):
-                    index[k][pattern].append((kmer, accession, position))
+            is_new_kmer = kmer not in human_locs
 
-            kept_rows += 1
+            human_locs[kmer].append((accession, position))
+            valid_rows += 1
+
+            if is_new_kmer:
+                unique_kmers += 1
+                k = len(kmer)
+
+                if k not in mask_cache:
+                    mask_cache[k] = precompute_mask_positions(
+                        k,
+                        max_candidate_mismatches,
+                    )
+
+                for pattern in generate_masked_patterns_from_positions(
+                    kmer,
+                    mask_cache[k],
+                ):
+                    human_index[k][pattern].append(kmer)
 
             if total_rows % 1_000_000 == 0:
                 print(
-                    f"[INFO] Indexed {total_rows:,} human rows; "
-                    f"kept {kept_rows:,}",
+                    f"[INFO] Human rows read: {total_rows:,}; "
+                    f"valid rows: {valid_rows:,}; "
+                    f"unique human k-mers: {unique_kmers:,}",
                     flush=True,
                 )
 
     print(
-        f"[INFO] Finished indexing human k-mers. "
-        f"Read {total_rows:,}; kept {kept_rows:,}.",
+        f"[INFO] Finished human loading/indexing. "
+        f"Rows read: {total_rows:,}; "
+        f"valid rows: {valid_rows:,}; "
+        f"unique human k-mers: {unique_kmers:,}",
         flush=True,
     )
 
-    return index
+    return human_locs, human_index, mask_cache
 
 
-def match_kmers_blosum(
-    human_csv,
-    virus_csv,
-    output_csv,
-    matrix_name="BLOSUM62",
-    min_similarity_percent=70.0,
-    max_candidate_mismatches=3,
-):
+def load_virus_unique_locs(virus_csv):
     """
-    Match virus k-mers to human k-mers using BLOSUM similarity.
+    Collapse virus rows by unique virus k-mer.
 
-    Important:
-        max_candidate_mismatches is not the biological cutoff.
-        It only controls which human k-mers are considered as candidates.
-
-        Final filtering is:
-            blosum_similarity_percent >= min_similarity_percent
+    Returns:
+        virus_locs[virus_kmer] = [(accession, position), ...]
     """
-    print(f"[INFO] Loading matrix: {matrix_name}", flush=True)
-    matrix = load_blosum_matrix(matrix_name)
+    virus_locs = defaultdict(list)
 
-    print(
-        f"[INFO] Building human candidate index using "
-        f"max_candidate_mismatches={max_candidate_mismatches}",
-        flush=True,
-    )
-    human_index = load_human_kmers_index(human_csv, max_candidate_mismatches)
+    total_rows = 0
+    valid_rows = 0
 
-    total_virus_rows = 0
-    total_candidates = 0
-    written_rows = 0
-
-    with open(virus_csv, newline="") as vf, open(output_csv, "w", newline="") as out:
-        reader = csv.DictReader(vf)
+    with open(virus_csv, newline="") as f:
+        reader = csv.DictReader(f)
 
         required = {"kmer", "accession", "position"}
         missing = required - set(reader.fieldnames or [])
@@ -267,6 +273,75 @@ def match_kmers_blosum(
                 f"Missing required columns in {virus_csv}: {sorted(missing)}"
             )
 
+        for row in reader:
+            total_rows += 1
+
+            kmer = row["kmer"].strip().upper()
+
+            if not is_valid_kmer(kmer):
+                continue
+
+            accession = row["accession"].strip()
+            position = row["position"].strip()
+
+            virus_locs[kmer].append((accession, position))
+            valid_rows += 1
+
+            if total_rows % 1_000_000 == 0:
+                print(
+                    f"[INFO] Virus rows read: {total_rows:,}; "
+                    f"valid rows: {valid_rows:,}; "
+                    f"unique virus k-mers: {len(virus_locs):,}",
+                    flush=True,
+                )
+
+    print(
+        f"[INFO] Finished virus loading. "
+        f"Rows read: {total_rows:,}; "
+        f"valid rows: {valid_rows:,}; "
+        f"unique virus k-mers: {len(virus_locs):,}",
+        flush=True,
+    )
+
+    return virus_locs
+
+
+# ------------------------------------------------------------
+# Main matching
+# ------------------------------------------------------------
+
+def match_kmers_blosum(
+    human_csv,
+    virus_csv,
+    output_csv,
+    matrix_name="BLOSUM62",
+    min_similarity_percent=80.0,
+    max_candidate_mismatches=1,
+):
+    print(f"[INFO] Loading matrix: {matrix_name}", flush=True)
+    matrix = load_blosum_matrix(matrix_name)
+    pair_score, self_score = matrix_to_fast_lookup(matrix)
+
+    print(
+        f"[INFO] Loading human k-mers using unique-kmer index. "
+        f"max_candidate_mismatches={max_candidate_mismatches}",
+        flush=True,
+    )
+
+    human_locs, human_index, mask_cache = load_human_unique_index(
+        human_csv,
+        max_candidate_mismatches,
+    )
+
+    print("[INFO] Loading virus k-mers as unique k-mer groups...", flush=True)
+    virus_locs = load_virus_unique_locs(virus_csv)
+
+    total_unique_virus = 0
+    total_candidates = 0
+    retained_unique_pairs = 0
+    written_rows = 0
+
+    with open(output_csv, "w", newline="") as out:
         writer = csv.writer(out)
 
         writer.writerow(
@@ -289,40 +364,37 @@ def match_kmers_blosum(
             ]
         )
 
-        for row in reader:
-            total_virus_rows += 1
-
-            virus_kmer = row["kmer"].strip().upper()
-            virus_accession = row["accession"].strip()
-            virus_position = row["position"].strip()
-
-            if not is_valid_kmer(virus_kmer):
-                continue
+        for virus_kmer, v_locs in virus_locs.items():
+            total_unique_virus += 1
 
             k = len(virus_kmer)
-            candidate_matches = set()
 
-            if max_candidate_mismatches == 0:
-                for candidate in human_index[k].get(virus_kmer, []):
-                    candidate_matches.add(candidate)
-            else:
-                for pattern in generate_masked_patterns(
-                    virus_kmer,
+            if k not in mask_cache:
+                mask_cache[k] = precompute_mask_positions(
+                    k,
                     max_candidate_mismatches,
-                ):
-                    for candidate in human_index[k].get(pattern, []):
-                        candidate_matches.add(candidate)
+                )
 
-            total_candidates += len(candidate_matches)
+            candidate_human_kmers = set()
 
-            for human_kmer, human_accession, human_position in candidate_matches:
+            for pattern in generate_masked_patterns_from_positions(
+                virus_kmer,
+                mask_cache[k],
+            ):
+                candidate_human_kmers.update(
+                    human_index[k].get(pattern, [])
+                )
+
+            total_candidates += len(candidate_human_kmers)
+
+            for human_kmer in candidate_human_kmers:
                 if len(human_kmer) != k:
                     continue
 
                 mismatches = count_mismatches(virus_kmer, human_kmer)
                 matches = k - mismatches
                 identity_fraction = matches / k
-                identity_percent = identity_fraction * 100
+                identity_percent = identity_fraction * 100.0
 
                 (
                     blosum_raw_score,
@@ -333,52 +405,68 @@ def match_kmers_blosum(
                 ) = calculate_blosum_scores(
                     virus_kmer,
                     human_kmer,
-                    matrix,
+                    pair_score,
+                    self_score,
                 )
 
-                if blosum_similarity_percent >= min_similarity_percent:
-                    writer.writerow(
-                        [
-                            virus_kmer,
-                            human_kmer,
-                            matches,
-                            mismatches,
-                            round(identity_fraction, 4),
-                            round(identity_percent, 2),
-                            round(blosum_raw_score, 4),
-                            round(blosum_self_virus, 4),
-                            round(blosum_self_human, 4),
-                            round(blosum_similarity_fraction, 4),
-                            round(blosum_similarity_percent, 2),
-                            human_accession,
-                            human_position,
-                            virus_accession,
-                            virus_position,
-                        ]
-                    )
+                if blosum_similarity_percent < min_similarity_percent:
+                    continue
 
-                    written_rows += 1
+                retained_unique_pairs += 1
+                h_locs = human_locs[human_kmer]
 
-            if total_virus_rows % 100_000 == 0:
+                for virus_accession, virus_position in v_locs:
+                    for human_accession, human_position in h_locs:
+                        writer.writerow(
+                            [
+                                virus_kmer,
+                                human_kmer,
+                                matches,
+                                mismatches,
+                                round(identity_fraction, 4),
+                                round(identity_percent, 2),
+                                round(blosum_raw_score, 4),
+                                round(blosum_self_virus, 4),
+                                round(blosum_self_human, 4),
+                                round(blosum_similarity_fraction, 4),
+                                round(blosum_similarity_percent, 2),
+                                human_accession,
+                                human_position,
+                                virus_accession,
+                                virus_position,
+                            ]
+                        )
+
+                        written_rows += 1
+
+            if total_unique_virus % 100_000 == 0:
                 print(
-                    f"[INFO] Processed {total_virus_rows:,} virus k-mers; "
-                    f"tested {total_candidates:,} candidates; "
-                    f"wrote {written_rows:,} BLOSUM matches",
+                    f"[INFO] Unique virus k-mers processed: {total_unique_virus:,}; "
+                    f"unique candidates tested: {total_candidates:,}; "
+                    f"retained unique pairs: {retained_unique_pairs:,}; "
+                    f"expanded rows written: {written_rows:,}",
                     flush=True,
                 )
 
     print(
-        f"[INFO] Finished. Processed {total_virus_rows:,} virus k-mers; "
-        f"tested {total_candidates:,} candidates; "
-        f"wrote {written_rows:,} BLOSUM matches.",
+        f"[INFO] Finished BLOSUM matching. "
+        f"Unique virus k-mers processed: {total_unique_virus:,}; "
+        f"unique candidates tested: {total_candidates:,}; "
+        f"retained unique pairs: {retained_unique_pairs:,}; "
+        f"expanded rows written: {written_rows:,}",
         flush=True,
     )
+
     print(f"[INFO] Output written to: {output_csv}", flush=True)
 
 
+# ------------------------------------------------------------
+# CLI
+# ------------------------------------------------------------
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="BLOSUM-based k-mer similarity matcher."
+        description="Optimized BLOSUM-based k-mer similarity matcher."
     )
 
     parser.add_argument(
@@ -405,17 +493,17 @@ def parse_args():
     parser.add_argument(
         "--min-similarity-percent",
         type=float,
-        default=70.0,
-        help="Minimum normalized BLOSUM similarity percent to keep. Default: 70.",
+        default=80.0,
+        help="Minimum normalized BLOSUM similarity percent to keep. Default: 80.",
     )
 
     parser.add_argument(
         "--max-candidate-mismatches",
         type=int,
-        default=3,
+        default=1,
         help=(
             "Masked-index candidate retrieval depth. "
-            "This is not the final cutoff. Default: 3."
+            "This is not the final biological cutoff. Default: 1."
         ),
     )
 
