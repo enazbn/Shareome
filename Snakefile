@@ -183,14 +183,12 @@ rule match_kmers_blosum:
         matched=os.path.join(OUTPUT_DIR, "{name}_blosum_matched.csv")
     params:
         matrix=lambda wc: config.get("blosum", {}).get("matrix", "BLOSUM62"),
-        min_similarity=lambda wc: config.get("blosum", {}).get(
-            "min_similarity_percent",
-            70
-        ),
-        max_candidate_mm=lambda wc: config.get("blosum", {}).get(
-            "max_candidate_mismatches",
-            3
-        )
+        min_similarity=lambda wc: config.get("blosum", {}).get("min_similarity_percent", 80),
+        max_candidate_mm=lambda wc: config.get("blosum", {}).get("max_candidate_mismatches", 1)
+    threads: 1
+    resources:
+        blosum_jobs=1,
+        mem_mb=120000
     log:
         "logs/{name}_blosum_matched.log"
     conda:
