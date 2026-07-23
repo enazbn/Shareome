@@ -1,5 +1,5 @@
 #!/bin/bash
-#PBS -N snakeRUNTest
+#PBS -N modeblosumoptimize
 #PBS -l select=1:ncpus=16:mem=128gb
 #PBS -l walltime=330:00:00
 #PBS -j oe
@@ -20,4 +20,4 @@ echo "Python path: $(which python)"
 echo "Snakemake path: $(which snakemake)"
 
 # Run Snakemake
-snakemake --use-conda  --cores 16
+snakemake --use-conda --cores 16 --resources blosum_jobs=1 --rerun-incomplete --printshellcmds

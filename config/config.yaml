@@ -2,7 +2,7 @@ fastas:
   - "CCHFV_seq_nr_clean.fasta"
   - "Rota_seq_nr_clean.fasta"
   - "RSV_seq_nr_clean.fasta"
-  - "human_refseq_nr_cleaned.fasta"
+  - "human_refseq_nr_curated_strict.fasta"
 
 input_dir: "data"
 output_dir: "results"
