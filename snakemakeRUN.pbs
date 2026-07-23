@@ -1,0 +1,23 @@
+#!/bin/bash
+#PBS -N snakeRUNTest
+#PBS -l select=1:ncpus=16:mem=128gb
+#PBS -l walltime=330:00:00
+#PBS -j oe
+#PBS -o /logs/run.out
+
+cd "$PBS_O_WORKDIR"
+
+# Load conda properly
+source ~/anaconda3/etc/profile.d/conda.sh
+
+# Activate your environment
+conda activate snakemake_env
+
+# Debug info (VERY useful on HPC)
+echo "Running on host: $(hostname)"
+echo "Working dir: $(pwd)"
+echo "Python path: $(which python)"
+echo "Snakemake path: $(which snakemake)"
+
+# Run Snakemake
+snakemake --use-conda  --cores 16
